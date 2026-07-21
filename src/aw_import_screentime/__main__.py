@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
+    Collection,
     Iterable,
     Iterator,
     Optional,
@@ -117,6 +118,7 @@ class OpenIntervalState:
 class WatchDefaults:
     device: tuple[DeviceId, ...] = ()
     storefront: tuple[Storefront, ...] = ()
+    all_devices: Optional[bool] = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -333,6 +335,10 @@ def load_app_config(config_path: Path) -> AppConfig:
     watch = WatchDefaults(
         device=_as_string_list(watch_raw.get("device"), field_name="watch.device"),
         storefront=_parse_storefronts(watch_raw.get("storefront")),
+        all_devices=_parse_optional_bool(
+            watch_raw.get("all_devices"),
+            field_name="watch.all_devices",
+        ),
     )
     activitywatch = ActivityWatchDefaults(
         testing=_parse_optional_bool(
@@ -395,6 +401,7 @@ def render_default_config() -> str:
 
 [watch]
 # device = ["5450A312-AF19-47F7-B5E2-2CE11F81B321"]
+# all_devices = true  # read every synced stream, ignoring DevicePeer platform
 storefront = ["us"]
 
 [activitywatch]
@@ -419,6 +426,12 @@ def resolve_device_filter(
     if config_devices:
         return list(config_devices)
     return None
+
+
+def resolve_all_devices_flag(cli_flag: bool, config_flag: Optional[bool]) -> bool:
+    if cli_flag:
+        return True
+    return bool(config_flag)
 
 
 def resolve_storefront_inputs(
@@ -616,6 +629,41 @@ def get_device_ids(db_path: Path, platform: int = 2) -> list[DeviceId]:
         devices = [row["device_id"] for row in rows]
         logger.info("Found %d device(s) for platform %s", len(devices), platform)
         return devices
+
+
+def get_stream_device_ids() -> list[DeviceId]:
+    """Return every device that has an App.InFocus stream directory on disk.
+
+    Screen Time syncs one stream directory per peer device, so the directory
+    listing is the complete set of devices sharing with this Mac.
+    """
+    if not STREAMS_DIR.is_dir():
+        logger.warning("Stream directory not found at %s", STREAMS_DIR)
+        return []
+    devices = sorted(p.name for p in STREAMS_DIR.iterdir() if p.is_dir())
+    logger.info("Found %d device stream directory(s)", len(devices))
+    return devices
+
+
+def resolve_target_devices(
+    selected: Optional[Collection[DeviceId]],
+    *,
+    platform: int = 2,
+    all_devices: bool = False,
+) -> list[DeviceId]:
+    """Resolve which devices to read from.
+
+    An explicit selection wins outright rather than being intersected with
+    DevicePeer: that table omits some synced peers entirely and files others
+    under a `platform` value that does not match the device, so intersecting
+    would silently drop devices the caller named. `all_devices` enumerates the
+    stream directories for the same reason.
+    """
+    if selected:
+        return sorted(selected)
+    if all_devices:
+        return get_stream_device_ids()
+    return get_device_ids(SYNC_DB_PATH, platform=platform)
 
 
 def iter_device_files(device_id: DeviceId) -> Iterator[Path]:
@@ -1255,13 +1303,20 @@ def global_opts(
 @app.command("devices")
 def cmd_devices(
     platform: int = typer.Option(2, "--platform", help="DevicePeer platform (2=iOS)"),
+    all_devices: bool = typer.Option(
+        False,
+        "--all-devices",
+        help="Enumerate stream directories instead of filtering DevicePeer by platform",
+    ),
     paths: bool = typer.Option(False, "--paths", help="Include stream-dir paths"),
 ) -> None:
-    """List available DevicePeer identifiers (optionally with stream-dir paths)."""
+    """List available device identifiers (optionally with stream-dir paths)."""
     print_json(
         data=[
             {"device_id": d, **({"path": str(STREAMS_DIR / d)} if paths else {})}
-            for d in get_device_ids(SYNC_DB_PATH, platform=platform)
+            for d in resolve_target_devices(
+                None, platform=platform, all_devices=all_devices
+            )
         ]
     )
 
@@ -1383,6 +1438,11 @@ def cmd_events_preview(
         help="Specific device identifier(s); omit = all devices.",
     ),
     platform: int = typer.Option(2, "--platform", help="DevicePeer platform (2=iOS)"),
+    all_devices: bool = typer.Option(
+        False,
+        "--all-devices",
+        help="Enumerate stream directories instead of filtering DevicePeer by platform",
+    ),
     limit: int = typer.Option(5, "--limit", "-n", help="Files per device (0 = all)"),
     since: Optional[str] = typer.Option(
         None,
@@ -1402,13 +1462,12 @@ def cmd_events_preview(
     since_dt = parse_since(since, tzinfo=tzinfo)
     storefronts = resolve_storefront_inputs(storefront, config.watch.storefront)
     selected_devices = resolve_device_filter(device, config.watch.device)
-    selected_set = set(selected_devices) if selected_devices else None
 
-    chosen = [
-        d
-        for d in get_device_ids(SYNC_DB_PATH, platform=platform)
-        if selected_set is None or d in selected_set
-    ]
+    chosen = resolve_target_devices(
+        selected_devices,
+        platform=platform,
+        all_devices=resolve_all_devices_flag(all_devices, config.watch.all_devices),
+    )
 
     results = []
     for dev in chosen:
@@ -1446,6 +1505,11 @@ def cmd_events_import(
         help="Specific device identifier(s); omit = all devices.",
     ),
     platform: int = typer.Option(2, "--platform", help="DevicePeer platform (2=iOS)"),
+    all_devices: bool = typer.Option(
+        False,
+        "--all-devices",
+        help="Enumerate stream directories instead of filtering DevicePeer by platform",
+    ),
     limit: int = typer.Option(5, "--limit", "-n", help="Files per device (0 = all)"),
     since: Optional[str] = typer.Option(
         None,
@@ -1478,7 +1542,9 @@ def cmd_events_import(
     since_dt = parse_since(since, tzinfo=tzinfo)
     storefronts = resolve_storefront_inputs(storefront, config.watch.storefront)
     selected_devices = resolve_device_filter(device, config.watch.device)
-    selected_set = set(selected_devices) if selected_devices else None
+    effective_all_devices = resolve_all_devices_flag(
+        all_devices, config.watch.all_devices
+    )
     effective_testing = resolve_testing_flag(testing, config)
     effective_port = resolve_aw_port(port, config)
     effective_bucket_suffix = resolve_bucket_suffix(bucket_suffix, config)
@@ -1497,11 +1563,9 @@ def cmd_events_import(
 
     sink: EventSink = ActivityWatchSink(client, bucket_suffix=effective_bucket_suffix)
 
-    chosen = [
-        d
-        for d in get_device_ids(SYNC_DB_PATH, platform=platform)
-        if selected_set is None or d in selected_set
-    ]
+    chosen = resolve_target_devices(
+        selected_devices, platform=platform, all_devices=effective_all_devices
+    )
 
     summaries = []
     for dev in chosen:
@@ -1615,6 +1679,12 @@ RETRY_DELAY_SECONDS = 5.0
 def cmd_watch(
     ctx: typer.Context,
     device: Optional[list[str]] = typer.Option(None, "--device", "-d"),
+    platform: int = typer.Option(2, "--platform", help="DevicePeer platform (2=iOS)"),
+    all_devices: bool = typer.Option(
+        False,
+        "--all-devices",
+        help="Enumerate stream directories instead of filtering DevicePeer by platform",
+    ),
     testing: Optional[bool] = typer.Option(None, "--testing/--no-testing"),
     port: Optional[int] = typer.Option(None, "--port"),
     storefront: Optional[list[str]] = typer.Option(None, "--storefront"),
@@ -1631,7 +1701,9 @@ def cmd_watch(
     tzinfo: dt_tzinfo = runtime_ctx.tzinfo
     storefronts = resolve_storefront_inputs(storefront, config.watch.storefront)
     selected_devices = resolve_device_filter(device, config.watch.device)
-    selected_set = set(selected_devices) if selected_devices else None
+    effective_all_devices = resolve_all_devices_flag(
+        all_devices, config.watch.all_devices
+    )
     effective_testing = resolve_testing_flag(testing, config)
     effective_port = resolve_aw_port(port, config)
     retry_delay_seconds = (
@@ -1648,9 +1720,8 @@ def cmd_watch(
             "aw-watcher-screentime", testing=effective_testing, port=effective_port
         )
 
-    all_ids = get_device_ids(SYNC_DB_PATH, platform=2)
-    ids = list(
-        all_ids if selected_set is None else (d for d in all_ids if d in selected_set)
+    ids = resolve_target_devices(
+        selected_devices, platform=platform, all_devices=effective_all_devices
     )
 
     wake = threading.Event()

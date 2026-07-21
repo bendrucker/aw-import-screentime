@@ -102,7 +102,9 @@ Continuously watch Biome for new SEGB files, stitch them into ActivityWatch inte
 aw-import-screentime watch --device ABCDEF0123456789
 ```
 
-- `--device / -d` filters the devices being watched (omit to include all).
+- `--device / -d` names the devices to watch, overriding discovery (omit to discover).
+- `--platform` selects the DevicePeer platform to discover (`2` = iOS).
+- `--all-devices` discovers from the stream directories instead of DevicePeer.
 - `--storefront` mirrors the events commands for title enrichment locales.
 - `--testing/--no-testing` and `--port` control which ActivityWatch server receives events.
 - Maintains per-device watermarks and automatically retries failed inserts after a short delay.
@@ -112,8 +114,9 @@ aw-import-screentime watch --device ABCDEF0123456789
 
 The `events` group provides read-only previews and ActivityWatch imports that share a common set of filters:
 
-- `--device / -d` limits processing to specific device identifiers.
+- `--device / -d` names specific device identifiers, overriding discovery.
 - `--platform` selects the DevicePeer platform (`2` = iOS).
+- `--all-devices` discovers from the stream directories instead of DevicePeer.
 - `--limit / -n` controls how many files per device are scanned (`0` = all).
 - `--since` clips stitched intervals to recent activity.
 - `--storefront` supplies App Store locales for title enrichment (defaults to `["us"]`).
@@ -158,14 +161,25 @@ aw-import-screentime file ... --raw --raw-limit 5 | jq .
 
 ### `devices`
 
-List DevicePeer identifiers discovered in `sync.db`.
+List device identifiers, by default those registered in `sync.db`.
 
 ```bash
 aw-import-screentime devices --paths | jq .
 ```
 
 - `--platform` lets you query a different Apple platform (default `2`, which is iOS).
+- `--all-devices` lists every synced stream directory instead.
 - `--paths` includes the resolved stream directory for each device.
+
+`DevicePeer` is an incomplete index of the devices actually syncing. A device
+can be filed under a `platform` value that does not describe it, and some
+streams have no `DevicePeer` row at all. As a result, a `--platform` filter can
+miss real devices while matching dataless rows, and no single platform value
+necessarily selects everything syncing to a given Mac.
+
+If `devices` omits a device you expect, compare against
+`devices --all-devices --paths` and pin the ones you want with `--device`, or
+set `all_devices = true` under `[watch]` in the config file.
 
 ## Testing with ActivityWatch port 5666
 
